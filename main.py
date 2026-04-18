@@ -1,103 +1,140 @@
-import asyncio
-import re
-import os
-import json
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message
-from aiogram.filters import Command
-import aiosqlite
-from asyncio import Queue
+# ==========================================
+# main.py
+# ==========================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+import logging
+import traceback
+import threading
+import time
+from flask import Flask, request, abort
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+import telebot
+from telebot.types import Message, CallbackQuery
 
-TIKTOK_REGEX = r"https?://.*tiktok\.com/.*"
-DB_PATH = "system.db"
+import database as db
+import keyboards as kb
+from smm_api import smm_api, translate_status
+from helpers import (
+    bot, escape_md, is_admin, check_subscription,
+    calculate_order_cost, safe_send, safe_edit
+)
+from config import (
+    WEBHOOK_URL, WEBHOOK_PATH, FLASK_HOST, FLASK_PORT,
+    SMM_SERVICES, MESSAGES
+)
 
-# Queue بدل Redis
-task_queue = Queue()
+# ================= Logging =================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-# --- DB ---
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            link TEXT,
-            status TEXT,
-            retries INTEGER DEFAULT 0
+# ================= Flask =================
+app = Flask(__name__)
+user_states = {}
+
+# ================= Webhook =================
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def webhook():
+    if request.headers.get("content-type") == "application/json":
+        json_string = request.get_data().decode("utf-8")
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return "OK", 200
+    return abort(403)
+
+@app.route("/")
+def index():
+    return "Bot Running", 200
+
+# ================= Helpers =================
+def get_or_create_user(message: Message):
+    db.create_or_update_user(
+        message.from_user.id,
+        message.from_user.username or "",
+        message.from_user.full_name or ""
+    )
+
+def send_main_menu(user_id):
+    user = db.get_user(user_id)
+    balance = user["balance"] if user else 0
+
+    text = f"👋 أهلاً\n💰 رصيدك: {balance}$"
+    safe_send(user_id, text, reply_markup=kb.main_menu_kb())
+
+# ================= Commands =================
+@bot.message_handler(commands=["start"])
+def start(message):
+    get_or_create_user(message)
+
+    if not check_subscription(message.from_user.id):
+        safe_send(
+            message.chat.id,
+            MESSAGES["not_subscribed"],
+            reply_markup=kb.join_channel_kb()
         )
-        """)
-        await db.commit()
-
-async def add_order(user_id, link):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "INSERT INTO orders (user_id, link, status) VALUES (?, ?, ?)",
-            (user_id, link, "pending")
-        )
-        await db.commit()
-        return cursor.lastrowid
-
-async def update_status(order_id, status):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE orders SET status=? WHERE id=?",
-            (status, order_id)
-        )
-        await db.commit()
-
-# --- Handlers ---
-@dp.message(Command("start"))
-async def start(msg: Message):
-    await msg.answer("👋 أرسل رابط TikTok")
-
-@dp.message()
-async def handle(msg: Message):
-    if not re.match(TIKTOK_REGEX, msg.text or ""):
         return
 
-    order_id = await add_order(msg.from_user.id, msg.text)
+    send_main_menu(message.chat.id)
 
-    await task_queue.put({
-        "order_id": order_id,
-        "user_id": msg.from_user.id,
-        "link": msg.text
-    })
+# ================= Messages =================
+@bot.message_handler(func=lambda m: m.text and "tiktok.com" in m.text)
+def handle_link(message):
+    user_id = message.from_user.id
 
-    await msg.answer(f"📥 تم تسجيل طلبك #{order_id}")
+    svc = list(SMM_SERVICES.values())[0]
 
-# --- Worker ---
-async def worker():
-    while True:
-        task = await task_queue.get()
+    cost = calculate_order_cost(svc["price_per_1000"], 1000)
+    balance = db.get_balance(user_id)
 
-        order_id = task["order_id"]
-        user_id = task["user_id"]
+    if balance < cost:
+        safe_send(user_id, "❌ رصيدك غير كافي")
+        return
 
-        try:
-            await update_status(order_id, "processing")
-            await asyncio.sleep(3)  # تنفيذ وهمي
+    safe_send(user_id, "⏳ جاري تنفيذ الطلب...")
 
-            await update_status(order_id, "completed")
-            await bot.send_message(user_id, f"✅ تم تنفيذ الطلب #{order_id}")
+    threading.Thread(
+        target=_process_smm_order,
+        args=(user_id, svc, message.text, 1000, cost),
+        daemon=True
+    ).start()
 
-        except Exception:
-            await update_status(order_id, "failed")
+# ================= SMM =================
+def _process_smm_order(user_id, svc, link, qty, cost):
+    try:
+        result = smm_api.create_order(svc["id"], link, qty)
 
-        task_queue.task_done()
+        if "error" in result:
+            safe_send(user_id, f"❌ فشل: {result['error']}")
+            return
 
-# --- تشغيل ---
-async def main():
-    await init_db()
+        db.update_balance(user_id, cost, "subtract")
 
-    for _ in range(2):
-        asyncio.create_task(worker())
+        safe_send(
+            user_id,
+            f"✅ تم الطلب\n🆔 {result.get('order')}"
+        )
 
-    await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(traceback.format_exc())
+        safe_send(user_id, "❌ خطأ غير متوقع")
 
+# ================= Fallback =================
+@bot.message_handler(func=lambda m: True)
+def fallback(message):
+    safe_send(message.chat.id, "❓ استخدم الأزرار")
+
+# ================= Webhook Setup =================
+def setup_webhook():
+    bot.remove_webhook()
+    time.sleep(1)
+    bot.set_webhook(url=WEBHOOK_URL)
+    logger.info("Webhook set")
+
+# ================= Run =================
 if __name__ == "__main__":
-    asyncio.run(main())
+    logger.info("Starting bot...")
+    db.init_db()
+    setup_webhook()
+    app.run(host=FLASK_HOST, port=FLASK_PORT)
