@@ -13,7 +13,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-TIKTOK_REGEX = r"https?://(www\.)?tiktok\.com/.*"
+TIKTOK_REGEX = r"https?://.*tiktok\.com/.*"
 DB_PATH = "system.db"
 
 # Queue بدل Redis
